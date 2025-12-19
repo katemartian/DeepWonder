@@ -149,10 +149,34 @@ def _set_lin(arr: np.ndarray, lin: np.ndarray, values: Any) -> None:
 def _intriangulation(vertices: np.ndarray, faces: np.ndarray, testp: np.ndarray) -> np.ndarray:
     """Ray casting test for points inside a closed triangulation."""
 
-    if faces.size == 0 or testp.size == 0:
+    if testp.size == 0:
         return np.zeros((testp.shape[0],), dtype=bool)
 
     verts = np.asarray(vertices, dtype=float)
+    if faces.size == 0:
+        # Fallback: approximate using the closest vertex direction if no triangulation is available.
+        center = verts.mean(axis=0)
+        v_centered = verts - center
+        v_norms = np.linalg.norm(v_centered, axis=1)
+        nonzero = v_norms > 0
+        if not np.any(nonzero):
+            return np.zeros((testp.shape[0],), dtype=bool)
+        v_dirs = v_centered[nonzero] / v_norms[nonzero][:, None]
+        v_norms = v_norms[nonzero]
+
+        testp = np.asarray(testp, dtype=float)
+        d = testp - center
+        d_norms = np.linalg.norm(d, axis=1)
+        inside = np.zeros(testp.shape[0], dtype=bool)
+        nonzero_d = d_norms > 0
+        if np.any(nonzero_d):
+            dirs = d[nonzero_d] / d_norms[nonzero_d][:, None]
+            dots = v_dirs @ dirs.T
+            idx = np.argmax(dots, axis=0)
+            max_r = v_norms[idx]
+            inside[nonzero_d] = d_norms[nonzero_d] <= (max_r + 1e-6)
+        inside[~nonzero_d] = True
+        return inside
     tris = np.asarray(faces, dtype=int)
     v0 = verts[tris[:, 0]]
     v1 = verts[tris[:, 1]]
@@ -861,25 +885,27 @@ def grow_neuron_dendrites(
         if vol_params.get("verbose", 1) > 1:
             start_t = time.time()
 
-        aproot = np.unravel_index(int(np.min(gp_soma[j][0])) - 1, tuple(fulldims), order="F")
+        aproot = np.array(np.unravel_index(int(np.min(gp_soma[j][0])) - 1, tuple(fulldims), order="F")) + 1
         numdt = max(1, int(dt_params[0] + round(dt_params[4] * rng.standard_normal())))
 
         borderflag = False
         try:
             if small_z:
                 rootL = np.array([fdims[0] / 2 + 1, fdims[1] / 2 + 1, allroots[j, 2]])
-                obstruction = cell_volume[
-                    allroots[j, 0] - fdims[0] // 2 : allroots[j, 0] + fdims[0] // 2,
-                    allroots[j, 1] - fdims[1] // 2 : allroots[j, 1] + fdims[1] // 2,
-                    :,
-                ]
+                x0 = allroots[j, 0] - fdims[0] // 2 - 1
+                x1 = allroots[j, 0] + fdims[0] // 2
+                y0 = allroots[j, 1] - fdims[1] // 2 - 1
+                y1 = allroots[j, 1] + fdims[1] // 2
+                obstruction = cell_volume[x0:x1, y0:y1, :]
             else:
                 rootL = np.array([fdims[0] / 2 + 1, fdims[1] / 2 + 1, fdims[2] / 2 + 1])
-                obstruction = cell_volume[
-                    allroots[j, 0] - fdims[0] // 2 : allroots[j, 0] + fdims[0] // 2,
-                    allroots[j, 1] - fdims[1] // 2 : allroots[j, 1] + fdims[1] // 2,
-                    allroots[j, 2] - fdims[2] // 2 : allroots[j, 2] + fdims[2] // 2,
-                ]
+                x0 = allroots[j, 0] - fdims[0] // 2 - 1
+                x1 = allroots[j, 0] + fdims[0] // 2
+                y0 = allroots[j, 1] - fdims[1] // 2 - 1
+                y1 = allroots[j, 1] + fdims[1] // 2
+                z0 = allroots[j, 2] - fdims[2] // 2 - 1
+                z1 = allroots[j, 2] + fdims[2] // 2
+                obstruction = cell_volume[x0:x1, y0:y1, z0:z1]
             if obstruction.shape != tuple(fdims):
                 raise ValueError("obstruction shape mismatch")
         except Exception:
@@ -925,7 +951,7 @@ def grow_neuron_dendrites(
         root = np.minimum(root, dims)
         M = 1 + dweight * rng.random((*dims, 6), dtype=np.float32)
 
-        aprootS = root + np.round((np.array(aproot) - allroots[j]) / dims_ss).astype(int)
+        aprootS = root + np.round((np.array(aproot) - allroots[j]) / dims_ss[2]).astype(int)
         aprootS = np.clip(aprootS, 1, dims)
         if aprootS[0] > root[0]:
             M[root[0] - 1 : aprootS[0], root[1] - 1, root[2] - 1, 0] = 0
@@ -1201,8 +1227,7 @@ def grow_apical_dendrites(
         ML[:, -1, :, 3] = np.inf
         ML[:, :, 0, 4] = np.inf
         ML[:, :, -1, 5] = np.inf
-        filled = obstruction * np.inf
-        filled[np.isnan(filled)] = 0
+        filled = np.where(obstruction > 0, np.inf, 0.0).astype(np.float32)
         ML = ML + filled[:, :, :, None]
         pathfromL = dendrite_dijkstra2(ML.reshape(-1, 6, order="F"), tuple(fdims), tuple(rootL))[1]
 
@@ -1781,13 +1806,13 @@ def sort_axons(vol_params: Dict[str, Any], axon_params: Dict[str, Any], gp_bgval
         rng = np.random.default_rng()
         for kk in range(len(gp_bgvals)):
             if kk not in idxlist:
-                index = n_comps + int(np.ceil((n_proc - n_comps) * rng.random())) - 1
+                index = int(rng.integers(n_comps, n_proc))
                 bg_proc[index][0] = np.concatenate([bg_proc[index][0], np.asarray(gp_bgvals[kk][0], dtype=np.int32)])
                 bg_proc[index][1] = np.concatenate([bg_proc[index][1], np.asarray(gp_bgvals[kk][1], dtype=np.float32)])
     else:
         rng = np.random.default_rng()
         for kk in range(len(gp_bgvals)):
-            index = int(np.ceil(n_proc * rng.random())) - 1
+            index = int(rng.integers(0, n_proc))
             bg_proc[index][0] = np.concatenate([bg_proc[index][0], np.asarray(gp_bgvals[kk][0], dtype=np.int32)])
             bg_proc[index][1] = np.concatenate([bg_proc[index][1], np.asarray(gp_bgvals[kk][1], dtype=np.float32)])
 
@@ -2100,7 +2125,7 @@ def dendrite_dijkstra2(m: np.ndarray, dims: Tuple[int, int, int], root: Tuple[in
                 continue
             if not to_visit[nb_idx]:
                 continue
-            weight = weights[nb_idx, weight_idx]
+            weight = weights[idx, weight_idx]
             cand = current_dist + float(weight)
             if cand < dist[nb_idx]:
                 dist[nb_idx] = cand
@@ -2260,14 +2285,14 @@ def dilate_dendrite_path_all(paths: np.ndarray, pathnums: np.ndarray, obstructio
 
         for idx in idxs:
             pidxs = idx + jidxs
-            pidxs = pidxs[(pidxs > 0) & (pidxs < pdims)]
+            pidxs = pidxs[(pidxs >= 0) & (pidxs < pdims)]
             pidxs = pidxs[paths.ravel()[pidxs] == 0]
             numval = pathnums.ravel()[idx]
             if pidxs.size:
                 keep = []
                 for pidx in pidxs:
                     didxs = pidx + dshifts
-                    didxs = didxs[(didxs > 0) & (didxs < pdims)]
+                    didxs = didxs[(didxs >= 0) & (didxs < pdims)]
                     if np.any(pathnums.ravel()[didxs] == numval):
                         keep.append(pidx)
                 pidxs = np.array(keep, dtype=int)
